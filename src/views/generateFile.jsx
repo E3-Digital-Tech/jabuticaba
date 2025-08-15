@@ -6,6 +6,7 @@ import { validateForm } from "../utils/validation";
 import PizZip from "pizzip";
 import Docxtemplater from "docxtemplater";
 import { readJSON, readFile, listDocx } from "../storage/opfs";
+import { supabase } from "../libs/supabase";
 
 export default function GenerateFile({ onBack }) {
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -21,36 +22,20 @@ export default function GenerateFile({ onBack }) {
     (async () => {
       const list = [];
 
-      // 1) Itens do servidor (se houver /index.json)
       try {
-        const res = await fetch("/index.json", { cache: "no-store" });
-        if (res.ok) {
-          const serverList = await res.json();
-          if (Array.isArray(serverList)) {
-            serverList.forEach((it) => {
+        const { data, error } = await supabase
+          .storage.from("contracts")
+          .download("index.json");
+        if (!error && data) {
+          const json = JSON.parse(await data.text());
+          if (Array.isArray(json)) {
+            json.forEach((it) => {
               if (it?.url?.toLowerCase().endsWith(".docx")) {
                 list.push({ name: it.name || it.url.split("/").pop(), source: "server", url: it.url });
               }
             });
           }
         }
-      } catch { }
-
-      // 2) Itens privados no OPFS (manifesto + descoberta do diretório)
-      try {
-        const manifest = await readJSON("index.json"); // pode estar vazio
-        manifest.forEach((it) => {
-          if (it?.path?.toLowerCase().endsWith(".docx")) {
-            list.push({ name: it.name || it.path.split("/").pop(), source: "opfs", path: it.path });
-          }
-        });
-        // (opcional) incluir arquivos “soltos” no OPFS:/files, caso não estejam no manifesto
-        const discovered = await listDocx("files");
-        discovered.forEach((f) => {
-          if (!list.some((x) => x.source === "opfs" && x.path === f.path)) {
-            list.push({ name: f.name, source: "opfs", path: f.path });
-          }
-        });
       } catch { }
 
       setFiles(list);

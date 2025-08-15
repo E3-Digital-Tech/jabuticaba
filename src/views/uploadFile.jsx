@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { ensureUniqueName, writeFile, readJSON, writeJSON } from "../storage/opfs";
+import { supabase } from "../libs/supabase";
 
 function slugify(str) {
   return String(str)
@@ -14,50 +14,89 @@ export default function UploadFile({ onBack }) {
   const [status, setStatus] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const supported =
-    typeof window !== "undefined" &&
-    "storage" in navigator &&
-    !!navigator.storage.getDirectory;
+  async function readManifest() {
+    const { data, error } = await supabase
+      .storage.from("contracts")
+      .download("index.json");
+    if (error) return [];
+    try {
+      const text = await data.text();
+      const json = JSON.parse(text);
+      return Array.isArray(json) ? json : [];
+    } catch {
+      return [];
+    }
+  }
+
+  async function writeManifest(list) {
+    const blob = new Blob([JSON.stringify(list, null, 2)], {
+      type: "application/json",
+    });
+    // upsert = true para sobrescrever/gerar
+    const { error } = await supabase
+      .storage.from("contracts")
+      .upload("index.json", blob, { upsert: true, contentType: "application/json" });
+    if (error) throw error;
+  }
+
+  async function ensureUniquePath(base, ext = ".docx") {
+    let candidate = `files/${base}${ext}`;
+    // tenta listar prefixo pra ver se já existe nome
+    const { data, error } = await supabase
+      .storage.from("contracts")
+      .list("files", { search: `${base}` });
+    if (error || !data) return candidate;
+
+    let i = 1;
+    const filenames = new Set(data.map((o) => o.name));
+    while (filenames.has(`${base}${i === 1 ? "" : `-${i}`}${ext}`)) i++;
+    candidate = `files/${base}${i === 1 ? "" : `-${i}`}${ext}`;
+    return candidate;
+  }
 
   async function handleUpload() {
     setStatus("");
-    if (!supported) {
-      setStatus("Este navegador não suporta o armazenamento privado (OPFS). Use Chrome/Edge em desktop.");
-      return;
-    }
     if (!name.trim()) return setStatus("Informe um nome para o contrato.");
     if (!file) return setStatus("Selecione um arquivo .docx.");
-
-    const extOk =
+    const isDocx =
       file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
       (file.name && file.name.toLowerCase().endsWith(".docx"));
-    if (!extOk) return setStatus("Apenas arquivos .docx são permitidos.");
+    if (!isDocx) return setStatus("Apenas .docx são permitidos.");
 
     setBusy(true);
     try {
-      // garante nome único dentro de OPFS:/files
       const base = slugify(name) || "contrato";
-      const unique = await ensureUniqueName(
-        await (await navigator.storage.getDirectory()).getDirectoryHandle("files", { create: true }),
-        base,
-        ".docx"
-      );
-      const destPath = `files/${unique}`;
+      const path = await ensureUniquePath(base, ".docx");
 
-      // grava arquivo e atualiza manifesto em OPFS:/index.json
-      await writeFile(destPath, file);
+      // 1) Upload do arquivo
+      const { error: upErr } = await supabase
+        .storage.from("contracts")
+        .upload(path, file, {
+          upsert: false, // se quiser sobrescrever: true (requer policy de update)
+          contentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        });
 
-      const manifest = await readJSON("index.json"); // manifesto privado do app
-      if (!manifest.some((it) => it && it.path === destPath)) {
-        manifest.push({ name: name.trim(), path: destPath, source: "opfs" });
-        await writeJSON("index.json", manifest);
+      if (upErr) {
+        console.error("Upload error:", upErr); // veja a msg completa no console
+        throw new Error(upErr.message || upErr.error || "Falha no upload");
       }
 
-      setStatus(`✅ Enviado: ${name.trim()} → ${destPath}`);
+      // 2) URL pública do arquivo
+      const { data: pub } = supabase.storage.from("contracts").getPublicUrl(path);
+      const url = pub?.publicUrl || null;
+
+      // 3) Atualiza manifesto index.json no bucket
+      const list = await readManifest();
+      if (!list.some((it) => it.url === url)) {
+        list.push({ name: name.trim(), url });
+        await writeManifest(list);
+      }
+
+      setStatus(`✅ Enviado: ${name.trim()} → ${url || path}`);
       setName("");
       setFile(null);
     } catch (e) {
-      setStatus(`❌ Erro ao enviar: ${e.message || e}`);
+      setStatus(`❌ Erro: ${e.message || e}`);
     } finally {
       setBusy(false);
     }
@@ -81,16 +120,10 @@ export default function UploadFile({ onBack }) {
       </button>
 
       <div className="bg-black/40 backdrop-blur-md shadow-lg rounded-2xl p-8 w-full max-w-xl text-white">
-        <h1 className="text-2xl font-bold mb-4 text-center">⬆️ Upload de arquivo (front-only)</h1>
+        <h1 className="text-2xl font-bold mb-4 text-center">⬆️ Upload (compartilhado)</h1>
         <p className="text-gray-300 mb-6 text-center">
-          Salva em armazenamento privado do site (OPFS), sem backend e sem escolher pasta.
+          O arquivo é salvo no <strong>Supabase Storage</strong> e o manifesto <code>index.json</code> é atualizado no mesmo bucket.
         </p>
-
-        {!supported && (
-          <div className="mb-4 text-sm text-yellow-300">
-            Seu navegador não suporta OPFS. Use Chrome/Edge em desktop (localhost ou HTTPS).
-          </div>
-        )}
 
         <div className="space-y-4">
           <input
@@ -118,18 +151,13 @@ export default function UploadFile({ onBack }) {
 
           <button
             onClick={handleUpload}
-            disabled={busy || !supported}
+            disabled={busy}
             className="w-full bg-blue-600 hover:bg-blue-500 disabled:bg-blue-900/50 text-white font-semibold py-3 rounded-lg shadow-md transition"
           >
             {busy ? "Enviando…" : "Enviar arquivo"}
           </button>
 
           {status && <p className="text-sm mt-2">{status}</p>}
-        </div>
-
-        <div className="mt-6 text-xs text-gray-400 leading-relaxed">
-          <p>• Arquivos ficam em OPFS (<em>armazenamento privado</em>); o site acessa direto, sem backend.</p>
-          <p>• O manifesto fica em <code>OPFS:/index.json</code>. Em produção você pode enviar um <code>/index.json</code> “base” no <code>public/</code> e mesclar com o do OPFS.</p>
         </div>
       </div>
     </div>
