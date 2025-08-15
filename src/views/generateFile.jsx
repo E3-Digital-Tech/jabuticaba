@@ -1,65 +1,87 @@
-// pontos principais do arquivo — substitua seu generateFile.jsx por este se quiser já integrado
 import React, { useEffect, useState } from "react";
 import InstructionsModal from "../components/InstructionsModal";
 import { generateContractFromTemplate } from "../utils/docx";
 import { validateForm } from "../utils/validation";
 import PizZip from "pizzip";
 import Docxtemplater from "docxtemplater";
-import { readJSON, readFile, listDocx } from "../storage/opfs";
-import { supabase } from "../libs/supabase";
+import { supabase } from "../libs/supabase"; // <-- certifique-se do caminho
 
 export default function GenerateFile({ onBack }) {
   const [isModalOpen, setIsModalOpen] = useState(false);
 
-  const [files, setFiles] = useState([]); // { name, source: 'server'|'opfs', url?, path? }
-  const [selected, setSelected] = useState(null);
+  const [files, setFiles] = useState([]); // { name, url }
+  const [loading, setLoading] = useState(true);
+
+  const [selected, setSelected] = useState(null); // { name, url }
   const [keys, setKeys] = useState([]);
   const [form, setForm] = useState({});
   const [parsing, setParsing] = useState(false);
-  const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    (async () => {
+  // Carrega do Supabase Storage
+  async function loadFromSupabase(force = false) {
+    setLoading(true);
+    try {
       const list = [];
 
-      try {
-        const { data, error } = await supabase
-          .storage.from("contracts")
-          .download("index.json");
-        if (!error && data) {
-          const json = JSON.parse(await data.text());
-          if (Array.isArray(json)) {
-            json.forEach((it) => {
-              if (it?.url?.toLowerCase().endsWith(".docx")) {
-                list.push({ name: it.name || it.url.split("/").pop(), source: "server", url: it.url });
-              }
-            });
+      // 1) Lista objetos em /files do bucket
+      const { data: objs, error } = await supabase
+        .storage
+        .from("contracts") // <-- bucket
+        .list("files", { limit: 1000 });
+
+      if (error) {
+        console.error("Erro ao listar Supabase:", error);
+      } else if (Array.isArray(objs)) {
+        for (const o of objs) {
+          if (!o || !o.name || !o.name.toLowerCase().endsWith(".docx")) continue;
+          const path = `files/${o.name}`;
+
+          // 2) URL pública (se bucket público). Se for privado, use createSignedUrl.
+          const { data: pub } = supabase.storage.from("contracts").getPublicUrl(path);
+          let url = pub?.publicUrl || null;
+
+          if (url) {
+            // 3) cache buster para forçar o refresh no CDN/navegador
+            url += (url.includes("?") ? "&" : "?") + `v=${force ? Date.now() : ""}`;
+            list.push({ name: o.name, url });
           }
         }
-      } catch { }
+      }
+
+      // Ordena por nome (ou o que preferir)
+      list.sort((a, b) => a.name.localeCompare(b.name));
 
       setFiles(list);
+    } finally {
       setLoading(false);
-    })();
+    }
+  }
+
+  useEffect(() => {
+    loadFromSupabase(false);
   }, []);
 
-  const pretty = (k) =>
-    k.replace(/[_\-.]+/g, " ").replace(/([a-z])([A-Z])/g, "$1 $2").replace(/\b\w/g, (c) => c.toUpperCase());
+  function pretty(k) {
+    return k
+      .replace(/[_\-.]+/g, " ")
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .replace(/\b\w/g, (c) => c.toUpperCase());
+  }
 
   async function parseTemplate(fileRef) {
     setParsing(true);
+    setKeys([]);
+    setForm({});
+
     try {
-      let arrayBuffer;
-      if (fileRef.source === "server") {
-        const resp = await fetch(fileRef.url);
-        arrayBuffer = await resp.arrayBuffer();
-      } else {
-        const file = await readFile(fileRef.path); // File (Blob) do OPFS
-        arrayBuffer = await file.arrayBuffer();
-      }
+      // força no-store no fetch do template
+      const resp = await fetch(fileRef.url, { cache: "no-store" });
+      if (!resp.ok) throw new Error("Falha ao baixar template");
+      const arrayBuffer = await resp.arrayBuffer();
 
       const zip = new PizZip(arrayBuffer);
       const doc = new Docxtemplater(zip, { paragraphLoop: true, linebreaks: true });
+
       const fullText = doc.getFullText ? doc.getFullText() : "";
       const found = Array.from(fullText.matchAll(/\{([\w.\-]+)\}/g)).map((m) => m[1]);
       const unique = Array.from(new Set(found));
@@ -67,9 +89,7 @@ export default function GenerateFile({ onBack }) {
       setKeys(unique);
       setForm(Object.fromEntries(unique.map((k) => [k, ""])));
     } catch (e) {
-      console.error(e);
-      setKeys([]);
-      setForm({});
+      console.error("parseTemplate error:", e);
       alert("Não foi possível ler o modelo selecionado.");
     } finally {
       setParsing(false);
@@ -80,8 +100,6 @@ export default function GenerateFile({ onBack }) {
     const idx = Number(e.target.value);
     const f = files[idx] || null;
     setSelected(f);
-    setKeys([]);
-    setForm({});
     if (f) parseTemplate(f);
   }
 
@@ -94,14 +112,7 @@ export default function GenerateFile({ onBack }) {
     if (!validateForm(form)) return alert("⚠️ Preencha todos os campos.");
 
     try {
-      if (selected.source === "server") {
-        await generateContractFromTemplate(form, selected.url); // URL
-      } else {
-        // OPFS: passamos o ArrayBuffer direto para o gerador
-        const file = await readFile(selected.path);
-        const ab = await file.arrayBuffer();
-        await generateContractFromTemplate(form, ab); // ArrayBuffer
-      }
+      await generateContractFromTemplate(form, selected.url); // utils/docx já lida com URL
     } catch (e) {
       console.error(e);
       alert("Erro ao gerar contrato, veja o console.");
@@ -118,6 +129,7 @@ export default function GenerateFile({ onBack }) {
         backgroundRepeat: "no-repeat",
       }}
     >
+      {/* Voltar */}
       <button
         onClick={onBack}
         className="fixed top-4 left-4 z-[60] px-4 py-2 rounded-full border border-gray-500/60 text-gray-200 bg-black/40 hover:bg-black/60 backdrop-blur transition"
@@ -126,12 +138,21 @@ export default function GenerateFile({ onBack }) {
       </button>
 
       <div className="bg-black/40 backdrop-blur-md shadow-lg rounded-2xl p-8 max-w-3xl w-full text-white">
-        <div className="flex justify-center mb-6">
-          <img src="/title-image.svg" alt="Título" className="max-w-full h-auto" />
+        <div className="flex justify-between items-center mb-6">
+          <img src="/title-image.svg" alt="Título" className="max-w-[180px] h-auto" />
+          <button
+            onClick={() => loadFromSupabase(true)}
+            className="px-4 py-2 border border-gray-500/60 rounded-full text-gray-200 bg-black/40 hover:bg-black/60 backdrop-blur transition"
+          >
+            ↻ Recarregar
+          </button>
         </div>
 
+        {/* Select de modelos */}
         <div className="mb-6">
-          <label className="block mb-2 text-sm text-gray-300">Selecione um modelo (.docx)</label>
+          <label className="block mb-2 text-sm text-gray-300">
+            Selecione um modelo (.docx) do Supabase
+          </label>
           <select
             onChange={handleSelect}
             className="w-full bg-black/30 text-gray-200 border border-gray-500 rounded-lg p-2 focus:ring-2 focus:ring-blue-500 focus:outline-none"
@@ -142,19 +163,21 @@ export default function GenerateFile({ onBack }) {
               {loading ? "Carregando..." : "Escolha um arquivo"}
             </option>
             {files.map((f, i) => (
-              <option key={`${f.source}-${i}`} value={i}>
-                {f.name} {f.source === "opfs" ? "• (local)" : ""}
+              <option key={f.url} value={i}>
+                {f.name}
               </option>
             ))}
           </select>
 
           {!loading && files.length === 0 && (
             <p className="mt-3 text-yellow-300 text-sm">
-              Nenhum arquivo encontrado. Faça upload em <strong>Upload de arquivo</strong>.
+              Nenhum arquivo encontrado no bucket <code>contracts/files</code>.
+              Faça upload e clique em <em>Recarregar</em>.
             </p>
           )}
         </div>
 
+        {/* Inputs dinâmicos */}
         {selected && (
           <div className="mt-6">
             <h2 className="text-lg font-semibold mb-3">

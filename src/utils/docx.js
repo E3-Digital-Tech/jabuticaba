@@ -2,12 +2,14 @@ import PizZip from "pizzip";
 import Docxtemplater from "docxtemplater";
 import { saveAs } from "file-saver";
 
-// templateSrc pode ser string (URL) OU ArrayBuffer (vindo do OPFS)
+// aceita URL (string) ou ArrayBuffer
 export async function generateContractFromTemplate(form, templateSrc = "/contrato_modelo.docx") {
   let arrayBuffer;
 
   if (typeof templateSrc === "string") {
-    const response = await fetch(templateSrc);
+    // cache buster + no-store
+    const bust = templateSrc.includes("?") ? "&" : "?";
+    const response = await fetch(`${templateSrc}${bust}v=${Date.now()}`, { cache: "no-store" });
     if (!response.ok) throw new Error(`Falha ao carregar template: ${templateSrc}`);
     arrayBuffer = await response.arrayBuffer();
   } else if (templateSrc instanceof ArrayBuffer) {
